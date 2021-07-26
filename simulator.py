@@ -1,4 +1,5 @@
 from wsi_mil.tile_wsi.sampler import TileSampler
+import pandas as pd
 import copy
 import openslide
 import pickle
@@ -47,28 +48,30 @@ class DatasetClusterer():
     def __init__(self, moco_path, n_cluster=10):
         self.moco_path = moco_path
         self.n_cluster = n_cluster
-        self.size_emb = 512
+        self.size_emb = 2048
         self.info_path = os.path.join(moco_path, 'info')
         self.mat_path = os.path.join(moco_path, 'mat_pca')
         self.clusterer = InductiveClusterer(KMeans(n_cluster), SVC(kernel='rbf', class_weight='balanced'))
-        self.train_classifier(n_dim=10)
-        self.preds = self.cluster_dataset(n_dim=10)
+        self.train_classifier(n_dim=20)
+        self.preds = self.cluster_dataset(n_dim=20)
         self.counter = self.count(self.preds)
         self.total_t = np.sum([n for n in self.counter.items()])
         self.centers = self.compute_cluster_centers(self.preds)
         self.pools = self.make_pool_for_sampling(self.preds)
 
     def train_classifier(self, n_dim=5):
-        args = Namespace(sampler='dpp', nb_tiles=20)
+        args = Namespace(sampler='dpp', nb_tiles=10)
         s = []
         for wsi in glob(os.path.join(self.mat_path, '*.npy')):
             m = np.load(wsi)
             ts = TileSampler(args=args, wsi_path=wsi, info_folder=self.info_path)
-            s.append(m[ts.dpp_sampler(20),:])
+            sample = ts.dpp_sampler(10)
+            s.append(m[sample,:])
+            print(len(sample))
         self.clusterer.fit(np.vstack(s)[:,:n_dim])
     
     def _get_ID_from_path(self, path):
-        return os.path.basename(path).split('_')[0]
+        return os.path.splitext(os.path.basename(path))[0].split('_embedded')[0]
 
     def cluster_dataset(self, n_dim=5):
         preds = dict()
@@ -100,6 +103,7 @@ class DatasetClusterer():
         for wsi in preds:
             for o,p in enumerate(preds[wsi]):
                 pools[p.item()].append((o, self._get_ID_from_path(wsi)))
+                print(self._get_ID_from_path(wsi))
         pools = {k:np.array(e) for k,e in pools.items()}
         return pools
             
@@ -113,6 +117,11 @@ class DatasetClusterer():
         return dist
 
 class WSISimulator(DatasetClusterer):
+    """
+    TODO : quand on crée dataset : créer readme avec les caractéristiques du dataset.
+    TODO : quand on crée le dataset : créer infos avec les infodict.pickle + Counter - comptant les classes.
+
+    """
     def __init__(self, moco_path, emb_path, n_cluster=10):
         """
         emb_path is the path for the embeddings to use for creating the dataset.
@@ -120,8 +129,9 @@ class WSISimulator(DatasetClusterer):
         super(WSISimulator, self).__init__(moco_path, n_cluster)
         self.emb_path = emb_path
         self.pools_c = copy.deepcopy(self.pools)
+        self.prop = None
 
-    def extract_images(self, cluster, raw_path, out_path):
+    def extract_images(self, raw_path, out_path):
         """
         Just to have a look at the clusters.
         """
@@ -129,18 +139,44 @@ class WSISimulator(DatasetClusterer):
         for l in self.pools.keys():
             selection = self.pools[l][np.random.choice(len(self.pools[l]), size=100, replace=False)]
             for s in selection:
+                print(s)
                 with open(self.get_path_from_ID(s[1], 'info'), 'rb') as f:
                     info = pickle.load(f)
                 slide = openslide.open_slide(glob(os.path.join(raw_path, s[1]+'*'))[0])
                 ims[l].append(get_image(slide, info[int(s[0])]))
-            
         ims = {k:Image.fromarray(einops.rearrange(ims[k], '(b1 b2) w h c -> (b1 w) (b2 h) c', b1=10, b2=10)) for k in ims.keys()}
+        [i.save(os.path.join(out_path, f'cluster_{o}.png')) for o, i in enumerate(ims)]
         return ims
 
-    def get_path_from_ID(self, i, file_type):
+    def get_path_from_ID(self, i, file_type='mat_pca'):
         suffix = '_infodict.pickle' if file_type == 'info' else '_embedded.npy'
         return os.path.join(self.emb_path, file_type, i+suffix)
 
+    def make_dataset(self, out, nwsi, problem, cluster, prop=None):
+        dic = []
+        out_mat = os.path.join(out, 'mat_pca')
+        out_info = os.path.join(out, 'info')
+        os.makedirs(out_mat, exist_ok=True)
+        os.makedirs(out_info, exist_ok=True)
+        for i in range(nwsi):
+            wsi, info, composition = self.sample_wsi(1000, problem, cluster, i%2, prop)
+            dic.append({'ID':f'wsi_{i}', 'target': i%2})
+            np.save(os.path.join(out_mat, f'wsi_{i}_embedded.npy'), wsi)
+            with open(os.path.join(out_info, f'wsi_{i}_infodict.pickle'), 'wb') as f:
+                pickle.dump(info, f)
+            with open(os.path.join(out_info, f'wsi_{i}_compo.pickle'), 'wb') as f:
+                pickle.dump(composition, f)
+        table_data = pd.DataFrame(dic)
+        table_data.to_csv(os.path.join(out, 'table_data.csv'), index=False)
+
+    def write_one_wsi(self, n, problem, cluster, prop=None, ntiles=1000, out="."):
+        wsi, info, composition = self.sample_wsi(ntiles, problem, cluster, n%2, prop)
+        np.save(os.path.join(out, f'wsi_{n}_embedded.npy'), wsi)
+        with open(os.path.join(out, f'wsi_{n}_infodict.pickle'), 'wb') as f:
+            pickle.dump(info, f)
+        with open(os.path.join(out, f'wsi_{n}_compo.pickle'), 'wb') as f:
+            pickle.dump(composition, f)
+         
     def sample_wsi(self, ntiles, problem, cluster, classif, prop=None):
         """presence_single_pattern.
         samples a WSI. The class 0 will be associated with the absence of the pattern
@@ -152,18 +188,27 @@ class WSISimulator(DatasetClusterer):
         :param classif: int, 0 or 1
         """
         probas = getattr(self, f"_sample_{problem}")(cluster, classif, prop)
-        sel_clust = np.random.choice(np.arange(self.n_cluster), size=ntiles, replace=False, p=probas)
+        sel_clust = np.random.choice(np.arange(self.n_cluster), size=ntiles, p=probas)
         wsi = []
+        infos = {} 
         composition = Counter(sel_clust)
+        n = 0
         for c in composition.keys():
             pool = self.pools_c[c]
             ids = np.random.choice(np.arange(len(pool)),size=composition[c], replace=False)
-            wsi += [np.load(self.get_path_from_ID(x[1]))[x[0], :] for x in pool[ids]]
-        wsi = np.random.shuffle(wsi)
-        return np.vstack(wsi)
+            for x in pool[ids]:
+                mat = np.load(self.get_path_from_ID(x[1]))
+                wsi.append(mat[int(x[0]), :])
+                infopath = self.get_path_from_ID(x[1], 'info')
+                with open(infopath, 'rb') as f:
+                    infodict = pickle.load(f)
+                infos[n] = infodict[int(x[0])]
+                infos[n]['name'] = x[1]
+                n += 1
+        return np.vstack(wsi), infos, composition
 
     def _sample_presence_single_pattern(self, cluster, classif, prop):
-        probas = np.zeros(len(self.n_cluster))        
+        probas = np.zeros(self.n_cluster)        
         for l in self.counter.keys():
             probas[l] = self.counter[l]
         if classif == 0:
@@ -184,7 +229,7 @@ class WSISimulator(DatasetClusterer):
         i.e a slide labeled 1 will have 2 times more tiles from cluster $cluster.
         """
         prop = 2 if prop is None else prop
-        probas = np.zeros(len(self.n_cluster))        
+        probas = np.zeros(self.n_cluster)        
         for l in self.counter.keys():
             probas[l] = self.counter[l]
         if classif:
@@ -192,13 +237,29 @@ class WSISimulator(DatasetClusterer):
         probas /= probas.sum()
         return probas
 
-
+    def _sample_prop(self, up=0.5, down=1.5, cluster=None):
+        if cluster is None:
+            cluster = list(range(self.n_cluster))
+        prop = np.ones(self.n_cluster)        
+        prop[np.array(cluster)] = np.random.uniform(up, down, size=len(cluster))
+        return prop
  
-
-
-            
-
-             
-
-
-
+    def _sample_proportion_several_pattern(self, cluster, classif, prop):
+        """
+        changes the proportion of some clusters.
+        If prop is None, then prop is set randomly.
+        """
+        if prop is None:
+            if self.prop is None:
+                self.prop = self._sample_prop(up, down, cluster)
+        else:
+            self.prop = np.ones(self.n_cluster)
+            self.prop[np.array(cluster)] = np.array(prop)
+        prop = self.prop
+        probas = np.zeros(self.n_cluster)        
+        for l in self.counter.keys():
+            probas[l] = self.counter[l]
+        if classif:
+            probas *= prop
+        probas /= probas.sum()
+        return probas
