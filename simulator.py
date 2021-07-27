@@ -8,6 +8,7 @@ import numpy as np
 from sklearn.svm import SVC
 from sklearn.base import BaseEstimator, clone
 from sklearn.utils.metaestimators import if_delegate_has_method
+from sklearn.model_selection import train_test_split
 import einops
 from PIL import Image
 import os
@@ -79,6 +80,16 @@ class DatasetClusterer():
             m = np.load(wsi)
             preds[wsi] = self.clusterer.predict(m[:,:n_dim]).reshape(-1,1)
         return preds
+
+    def split_val_train_test(self):
+        wsis = glob(os.path.join(self.mat_path, '*.npy'))
+        train, test = train_test_split(wsis, test_size=0.2)
+        train, val = train_test_split(train, test_size=0.2)
+        pools = {'train': None, 'val': None, 'test': None}
+        pools['train'] = self.make_pool_for_sampling(self, train)
+        pools['val'] = self.make_pool_for_sampling(self, val)
+        pools['test']= self.make_pool_for_sampling(self, test)
+        return pools
 
     def count(self, preds):
         return Counter(np.vstack([preds[x] for x in preds]).reshape(-1))
@@ -154,20 +165,23 @@ class WSISimulator(DatasetClusterer):
 
     def make_dataset(self, out, nwsi, problem, cluster, prop=None):
         dic = []
-        out_mat = os.path.join(out, 'mat_pca')
-        out_info = os.path.join(out, 'info')
-        os.makedirs(out_mat, exist_ok=True)
-        os.makedirs(out_info, exist_ok=True)
-        for i in range(nwsi):
-            wsi, info, composition = self.sample_wsi(1000, problem, cluster, i%2, prop)
-            dic.append({'ID':f'wsi_{i}', 'target': i%2})
-            np.save(os.path.join(out_mat, f'wsi_{i}_embedded.npy'), wsi)
-            with open(os.path.join(out_info, f'wsi_{i}_infodict.pickle'), 'wb') as f:
-                pickle.dump(info, f)
-            with open(os.path.join(out_info, f'wsi_{i}_compo.pickle'), 'wb') as f:
-                pickle.dump(composition, f)
-        table_data = pd.DataFrame(dic)
-        table_data.to_csv(os.path.join(out, 'table_data.csv'), index=False)
+        folds = ['train', 'val', 'test']
+        nwsis = {'train': nwsi, 'val': int(nwsi/4), 'test': int(nwsi/4)}
+        for fold in folds:
+            out_mat = os.path.join(out, fold, 'mat_pca')
+            out_info = os.path.join(out, fold, 'info')
+            os.makedirs(out_mat, exist_ok=True)
+            os.makedirs(out_info, exist_ok=True)
+            for i in range(nwsis[fold]):
+                wsi, info, composition = self.sample_wsi(1000, problem, cluster, i%2, fold, prop)
+                dic.append({'ID':f'wsi_{i}', 'target': i%2, 'fold':fold})
+                np.save(os.path.join(out_mat, f'wsi_{i}_embedded.npy'), wsi)
+                with open(os.path.join(out_info, f'wsi_{i}_infodict.pickle'), 'wb') as f:
+                    pickle.dump(info, f)
+                with open(os.path.join(out_info, f'wsi_{i}_compo.pickle'), 'wb') as f:
+                    pickle.dump(composition, f)
+            table_data = pd.DataFrame(dic)
+            table_data.to_csv(os.path.join(out, 'table_data.csv'), index=False)
 
     def write_one_wsi(self, n, problem, cluster, prop=None, ntiles=1000, out="."):
         wsi, info, composition = self.sample_wsi(ntiles, problem, cluster, n%2, prop)
@@ -177,7 +191,7 @@ class WSISimulator(DatasetClusterer):
         with open(os.path.join(out, f'wsi_{n}_compo.pickle'), 'wb') as f:
             pickle.dump(composition, f)
          
-    def sample_wsi(self, ntiles, problem, cluster, classif, prop=None):
+    def sample_wsi(self, ntiles, problem, cluster, classif, fold='train', prop=None):
         """presence_single_pattern.
         samples a WSI. The class 0 will be associated with the absence of the pattern
         of $cluster. 
@@ -194,8 +208,9 @@ class WSISimulator(DatasetClusterer):
         composition = Counter(sel_clust)
         n = 0
         for c in composition.keys():
-            pool = self.pools_c[c]
+            pool = self.pools_c[fold][c]
             ids = np.random.choice(np.arange(len(pool)),size=composition[c], replace=False)
+            # TODO Delete from pools afterward ? Or allow duplicates between slides?
             for x in pool[ids]:
                 mat = np.load(self.get_path_from_ID(x[1]))
                 wsi.append(mat[int(x[0]), :])
